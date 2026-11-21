@@ -1,373 +1,447 @@
-// SHADOWLINE — the simulation: movement, noise, guard senses and the win.
-// The world is pure data plus one step function, so the screenshot scenes
-// can play it forward from a seed and get the same frame every time.
+// The simulation: one step of the museum. Pure logic, no DOM — the same
+// code runs in the browser and in the headless autopilot, so a staged
+// screenshot and a played game can never disagree about the rules.
 import {
-  ALERT_AT, CATCH_DISTANCE, CLOSE_SPOT_DISTANCE, COINS_PER_LEVEL,
-  COIN_FLIGHT_TIME, GUARD_CHASE_SPEED,
-  GUARD_PAUSE_AT_WAYPOINT, GUARD_SEARCH_SPEED, GUARD_SEARCH_TIME,
-  MOD_BUSH, MOD_DARK, MOD_RUN, MOD_SNEAK, NOISE_COIN, NOISE_RUN,
-  NOISE_SNEAK, NOISE_WALK, SCORE_ARTIFACT, SCORE_GHOST_BONUS,
-  SCORE_LEVEL_CLEAR, SCORE_TIME_BONUS_PER_SECOND, SPEED_RUN, SPEED_SNEAK,
-  SPEED_WALK, STEP, SUSPICIOUS_AT, VISION_DECAY, VISION_FILL_CLOSE,
-  VISION_FILL_FAR, VISION_FILL_MID, VISION_HALF_ANGLE, VISION_RANGE,
+  ALERT_AT,
+  COVER_BUSH,
+  COVER_DARK,
+  DETECT_DECAY,
+  DETECT_RATE,
+  GHOST_BONUS,
+  GHOST_MAX_DETECTION,
+  GUARD_CHASE,
+  GUARD_PATROL,
+  GUARD_SUSPICIOUS,
+  LEVEL_CLEAR_SCORE,
+  NOISE_COIN_RADIUS,
+  NOISE_RUN_RADIUS,
+  PLAYER_RUN,
+  PLAYER_SNEAK,
+  RELIC_SCORE,
+  SEARCH_TIME,
+  SHADOW_BONUS,
+  SHADOW_MAX_DETECTION,
+  STUCK_GIVE_UP,
+  SUSPICIOUS_AT,
+  VISION_HALF_ANGLE,
+  VISION_RANGE,
 } from './config.js';
-import { parseLevel } from './levels.js';
+import { LEVELS, parseLevel } from './levels.js';
+import { makeRng } from './random.js';
 
-export const EVENT_NONE = 0;
-export const EVENT_ARTIFACT = 1;
-export const EVENT_SUSPICIOUS = 2;
-export const EVENT_ALARM = 4;
-export const EVENT_CAUGHT = 8;
-export const EVENT_LEVEL_CLEAR = 16;
-export const EVENT_COIN = 32;
-
-const PLAYER_RADIUS = 0.32;
-
-// A tile blocks movement and sight ('#', 'C'); a bush hides but lets you pass.
-function blocksMove(tile) { return tile === '#' || tile === 'C'; }
-function blocksSight(tile) { return tile === '#' || tile === 'C'; }
-
-export function createWorld(random, levelDef, carriedScore = 0) {
-  const level = parseLevel(levelDef);
-  const state = {
-    level,
-    random,
-    time: 0,
-    score: carriedScore,
-    levelScore: 0,
-    artifactsTaken: 0,
-    coins: COINS_PER_LEVEL,
-    coinsThrown: [],
-    alarm: false,
-    everAlerted: false,
-    timesSuspicious: 0,
-    caught: false,
-    cleared: false,
-    player: {
-      x: level.player.x + 0.5,
-      y: level.player.y + 0.5,
-      dirX: 1,
-      dirY: 0,
-      moving: false,
-      sneaking: false,
-      running: false,
-      hidden: false,
-    },
-    guards: level.guards.map((g) => ({
-      x: g.x + 0.5,
-      y: g.y + 0.5,
-      waypoints: g.waypoints,
-      waypointIndex: 1 % g.waypoints.length,
-      speed: g.speed,
-      facing: 0,
-      meter: 0,
-      state: 'patrol',
-      pause: 0,
-      searchTimer: 0,
-      targetX: g.x + 0.5,
-      targetY: g.y + 0.5,
-      lastSeenX: g.x + 0.5,
-      lastSeenY: g.y + 0.5,
-      scanDir: 1,
-    })),
-    artifacts: level.artifacts.map((a) => ({ ...a })),
-    exitOpen: false,
-    detection: 0, // the highest guard meter, for the HUD eye
-    noiseX: -1,
-    noiseY: -1,
-    noiseRadius: 0,
-    noiseTimer: 0,
-    message: '',
-    messageTimer: 0,
-  };
-  // Guards start facing along their first patrol leg.
-  for (const guard of state.guards) {
-    const [wx, wy] = guard.waypoints[guard.waypointIndex];
-    guard.facing = Math.atan2(wy + 0.5 - guard.y, wx + 0.5 - guard.x);
-  }
-  return { state, random };
-}
-
-function tileAt(state, x, y) {
+export function tileAt(w, x, y) {
   const tx = Math.floor(x);
   const ty = Math.floor(y);
-  if (tx < 0 || ty < 0 || tx >= state.level.cols || ty >= state.level.rows) return '#';
-  return state.level.tiles[ty][tx];
+  if (tx < 0 || ty < 0 || tx >= w.cols || ty >= w.rows) return '#';
+  return w.grid[ty][tx];
 }
 
-function canStand(state, x, y) {
-  // Circle-vs-grid: the player fits if none of the tiles its disc overlaps
-  // is solid. Checking the four corners of the disc's bounding box is
-  // enough at this radius.
-  for (const [ox, oy] of [[-PLAYER_RADIUS, -PLAYER_RADIUS], [PLAYER_RADIUS, -PLAYER_RADIUS],
-    [-PLAYER_RADIUS, PLAYER_RADIUS], [PLAYER_RADIUS, PLAYER_RADIUS]]) {
-    if (blocksMove(tileAt(state, x + ox, y + oy))) return false;
+export function isWall(w, x, y) {
+  return tileAt(w, x, y) === '#';
+}
+
+export function isWalkable(w, x, y) {
+  return !isWall(w, x, y);
+}
+
+// Cover factor of the tile under a point: 1 in the open, less in the dark,
+// least in a bush. Detection climbs in proportion to it.
+export function coverAt(w, x, y) {
+  const t = tileAt(w, x, y);
+  if (t === 'B') return COVER_BUSH;
+  if (t === ',') return COVER_DARK;
+  return 1;
+}
+
+// Line of sight: sample the segment every 0.15 tiles; a wall sample blocks.
+export function losClear(w, x0, y0, x1, y1) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const dist = Math.hypot(dx, dy);
+  const steps = Math.max(1, Math.ceil(dist / 0.15));
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    if (isWall(w, x0 + dx * t, y0 + dy * t)) return false;
   }
   return true;
 }
 
 function angleDiff(a, b) {
   let d = a - b;
-  while (d > Math.PI) d -= 2 * Math.PI;
-  while (d < -Math.PI) d += 2 * Math.PI;
-  return d;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return Math.abs(d);
 }
 
-function hasLineOfSight(state, x0, y0, x1, y1) {
-  const dx = x1 - x0;
-  const dy = y1 - y0;
+// Can this guard see the player right now? Range, cone and line of sight.
+export function guardSees(w, guard, px, py) {
+  const dx = px - guard.x;
+  const dy = py - guard.y;
   const dist = Math.hypot(dx, dy);
-  const steps = Math.max(1, Math.ceil(dist / 0.2));
-  for (let i = 1; i < steps; i += 1) {
-    const t = i / steps;
-    if (blocksSight(tileAt(state, x0 + dx * t, y0 + dy * t))) return false;
+  if (dist > VISION_RANGE) return false;
+  if (dist > 0.01) {
+    const ang = Math.atan2(dy, dx);
+    if (angleDiff(ang, guard.dir) > VISION_HALF_ANGLE) return false;
   }
-  return true;
+  return losClear(w, guard.x, guard.y, px, py);
 }
 
-function guardSeesPlayer(state, guard) {
-  const p = state.player;
-  const dx = p.x - guard.x;
-  const dy = p.y - guard.y;
-  const dist = Math.hypot(dx, dy);
-  if (dist > VISION_RANGE) return { sees: false, dist };
-  const angle = Math.atan2(dy, dx);
-  if (Math.abs(angleDiff(angle, guard.facing)) > VISION_HALF_ANGLE) return { sees: false, dist };
-  if (!hasLineOfSight(state, guard.x, guard.y, p.x, p.y)) return { sees: false, dist };
-  // A player flat in a bush is nearly invisible past two tiles.
-  const tile = tileAt(state, p.x, p.y);
-  if (tile === 'B' && dist > 2) return { sees: false, dist };
-  return { sees: true, dist };
+// The set of tile keys any guard can currently see (centre in cone + LOS).
+// The autopilot plans around it; the renderer can reuse it for debugging.
+export function computeWatched(w) {
+  const watched = new Set();
+  for (const guard of w.guards) {
+    const gx = Math.floor(guard.x);
+    const gy = Math.floor(guard.y);
+    const r = Math.ceil(VISION_RANGE);
+    for (let ty = gy - r; ty <= gy + r; ty++) {
+      for (let tx = gx - r; tx <= gx + r; tx++) {
+        if (tx < 0 || ty < 0 || tx >= w.cols || ty >= w.rows) continue;
+        if (guardSees(w, guard, tx + 0.5, ty + 0.5)) watched.add(tx + ',' + ty);
+      }
+    }
+  }
+  return watched;
 }
 
-function moveGuardToward(state, guard, tx, ty, speed, dt) {
-  const dx = tx - guard.x;
-  const dy = ty - guard.y;
-  const dist = Math.hypot(dx, dy);
-  if (dist < 0.05) {
-    guard.stuck = 0;
-    return true;
-  }
-  const stepLen = Math.min(dist, speed * dt);
-  const beforeX = guard.x;
-  const beforeY = guard.y;
-  const nx = guard.x + (dx / dist) * stepLen;
-  const ny = guard.y + (dy / dist) * stepLen;
-  // Guards slide along walls instead of sticking on corners.
-  if (canStand(state, nx, guard.y)) guard.x = nx;
-  if (canStand(state, guard.x, ny)) guard.y = ny;
-  guard.facing = Math.atan2(dy, dx);
-  // A target on the far side of a wall can never be reached: after a second
-  // pressed against the wall, give up and search in place instead of
-  // standing there for the rest of the level.
-  const moved = Math.hypot(guard.x - beforeX, guard.y - beforeY);
-  if (moved < 0.001 && dist > 0.4) guard.stuck = (guard.stuck || 0) + dt;
-  else guard.stuck = 0;
-  if ((guard.stuck || 0) > 1.2) {
-    guard.stuck = 0;
-    return true;
-  }
-  return dist - stepLen < 0.08;
-}
-
-export function stepWorld(world, dt, input) {
-  const state = world.state;
-  if (state.caught || state.cleared) return EVENT_NONE;
-  state.time += dt;
-  let events = EVENT_NONE;
-  const p = state.player;
-
-  // --- Player movement -------------------------------------------------
-  const mag = Math.hypot(input.x, input.y);
-  p.moving = mag > 0.1;
-  if (p.moving) {
-    const nx = input.x / (mag || 1);
-    const ny = input.y / (mag || 1);
-    p.dirX = nx;
-    p.dirY = ny;
-    p.sneaking = !!input.sneak;
-    p.running = !!input.run && !input.sneak;
-    const speed = p.sneaking ? SPEED_SNEAK : p.running ? SPEED_RUN : SPEED_WALK;
-    const tryX = p.x + nx * speed * dt;
-    const tryY = p.y + ny * speed * dt;
-    if (canStand(state, tryX, p.y)) p.x = tryX;
-    if (canStand(state, p.x, tryY)) p.y = tryY;
-  } else {
-    p.sneaking = false;
-    p.running = false;
-  }
-  p.hidden = tileAt(state, p.x, p.y) === 'B';
-
-  // Noise: running carries, walking murmurs, sneaking barely whispers.
-  const noiseRadius = !p.moving ? 0 : p.running ? NOISE_RUN : p.sneaking ? NOISE_SNEAK : NOISE_WALK;
-  if (noiseRadius > 0) {
-    state.noiseX = p.x;
-    state.noiseY = p.y;
-    state.noiseRadius = noiseRadius;
-    state.noiseTimer = 0.12;
-  } else if (state.noiseTimer > 0) {
-    state.noiseTimer -= dt;
-  }
-
-  // --- Thrown coins -----------------------------------------------------
-  if (input.throwAt && state.coins > 0) {
-    state.coins -= 1;
-    state.coinsThrown.push({
-      fromX: p.x, fromY: p.y,
-      toX: input.throwAt.x, toY: input.throwAt.y,
-      t: 0, duration: COIN_FLIGHT_TIME,
-    });
-    events |= EVENT_COIN;
-  }
-  for (const coin of state.coinsThrown) coin.t += dt;
-  const landed = state.coinsThrown.filter((c) => c.t >= c.duration);
-  state.coinsThrown = state.coinsThrown.filter((c) => c.t < c.duration);
-  for (const coin of landed) {
-    for (const guard of state.guards) {
-      const d = Math.hypot(guard.x - coin.toX, guard.y - coin.toY);
-      if (d <= NOISE_COIN && guard.state !== 'alert') {
-        guard.state = 'suspicious';
-        guard.targetX = coin.toX;
-        guard.targetY = coin.toY;
-        guard.searchTimer = GUARD_SEARCH_TIME;
-      }
-    }
-  }
-
-  // --- Guards ------------------------------------------------------------
-  let maxMeter = 0;
-  for (const guard of state.guards) {
-    const { sees, dist } = guardSeesPlayer(state, guard);
-    if (sees) {
-      guard.lastSeenX = p.x;
-      guard.lastSeenY = p.y;
-      let fill = dist < 2 ? VISION_FILL_CLOSE : dist < 4 ? VISION_FILL_MID : VISION_FILL_FAR;
-      if (p.sneaking) fill *= MOD_SNEAK;
-      if (p.running) fill *= MOD_RUN;
-      if (p.hidden) fill *= MOD_BUSH;
-      else if (tileAt(state, p.x, p.y) === ',') fill *= MOD_DARK;
-      if (dist < CLOSE_SPOT_DISTANCE) fill *= 2;
-      guard.meter = Math.min(ALERT_AT, guard.meter + fill * dt);
-      if (guard.meter >= SUSPICIOUS_AT && guard.state === 'patrol') {
-        guard.state = 'suspicious';
-        guard.targetX = guard.lastSeenX;
-        guard.targetY = guard.lastSeenY;
-        guard.searchTimer = GUARD_SEARCH_TIME;
-        state.timesSuspicious += 1;
-        events |= EVENT_SUSPICIOUS;
-      }
-      if (guard.meter >= ALERT_AT && !state.alarm) {
-        state.alarm = true;
-        state.everAlerted = true;
-        events |= EVENT_ALARM;
-        for (const other of state.guards) {
-          if (other.state !== 'alert') {
-            other.state = 'alert';
-            other.targetX = p.x;
-            other.targetY = p.y;
-          }
-        }
-      }
-      if (state.alarm) {
-        guard.state = 'alert';
-        guard.targetX = p.x;
-        guard.targetY = p.y;
-      }
-    } else {
-      guard.meter = Math.max(0, guard.meter - VISION_DECAY * dt);
-      if (state.alarm && guard.state === 'alert') {
-        // Lost the player: hunt the last seen spot, then search.
-        guard.targetX = guard.lastSeenX;
-        guard.targetY = guard.lastSeenY;
-      }
-    }
-    maxMeter = Math.max(maxMeter, guard.meter);
-
-    // Hearing: footsteps inside the noise ring draw a look.
-    if (state.noiseTimer > 0 && guard.state === 'patrol') {
-      const d = Math.hypot(guard.x - state.noiseX, guard.y - state.noiseY);
-      if (d <= state.noiseRadius + 0.6) {
-        guard.state = 'suspicious';
-        guard.targetX = state.noiseX;
-        guard.targetY = state.noiseY;
-        guard.searchTimer = GUARD_SEARCH_TIME;
-        state.timesSuspicious += 1;
-        events |= EVENT_SUSPICIOUS;
-      }
-    }
-
-    // State machine.
-    if (guard.state === 'patrol') {
-      if (guard.pause > 0) {
-        guard.pause -= dt;
-        guard.facing += guard.scanDir * 0.9 * dt;
-      } else {
-        const [wx, wy] = guard.waypoints[guard.waypointIndex];
-        const arrived = moveGuardToward(state, guard, wx + 0.5, wy + 0.5, guard.speed, dt);
-        if (arrived) {
-          guard.pause = GUARD_PAUSE_AT_WAYPOINT;
-          guard.scanDir = state.random.next() < 0.5 ? 1 : -1;
-          guard.waypointIndex = (guard.waypointIndex + 1) % guard.waypoints.length;
-        }
-      }
-    } else if (guard.state === 'suspicious' || guard.state === 'search') {
-      const arrived = moveGuardToward(state, guard, guard.targetX, guard.targetY, GUARD_SEARCH_SPEED, dt);
-      if (arrived) {
-        guard.searchTimer -= dt;
-        guard.facing += guard.scanDir * 1.4 * dt;
-        if (guard.searchTimer <= 0) {
-          guard.state = 'patrol';
-          guard.meter = Math.min(guard.meter, SUSPICIOUS_AT - 1);
-        }
-      }
-    } else if (guard.state === 'alert') {
-      const arrived = moveGuardToward(state, guard, guard.targetX, guard.targetY, GUARD_CHASE_SPEED, dt);
-      if (arrived && !sees) {
-        guard.state = 'search';
-        guard.searchTimer = GUARD_SEARCH_TIME;
-      }
-    }
-
-    // Caught: a guard closes the last half-tile.
-    if (Math.hypot(guard.x - p.x, guard.y - p.y) < CATCH_DISTANCE) {
-      state.caught = true;
-      events |= EVENT_CAUGHT;
-    }
-  }
-  state.detection = maxMeter;
-  if (state.alarm) state.detection = Math.max(state.detection, ALERT_AT);
-
-  // --- Artifacts and the exit -------------------------------------------
-  for (const artifact of state.artifacts) {
-    if (!artifact.taken && Math.hypot(artifact.x + 0.5 - p.x, artifact.y + 0.5 - p.y) < 0.7) {
-      artifact.taken = true;
-      state.artifactsTaken += 1;
-      state.score += SCORE_ARTIFACT;
-      state.levelScore += SCORE_ARTIFACT;
-      state.message = 'Relic secured.';
-      state.messageTimer = 2;
-      events |= EVENT_ARTIFACT;
-    }
-  }
-  state.exitOpen = state.artifactsTaken === state.artifacts.length;
-  if (state.messageTimer > 0) state.messageTimer -= dt;
-  if (state.exitOpen && Math.hypot(state.level.exit.x + 0.5 - p.x, state.level.exit.y + 0.5 - p.y) < 0.7) {
-    state.cleared = true;
-    const timeBonus = Math.max(0, Math.round((state.level.parSeconds - state.time) * SCORE_TIME_BONUS_PER_SECOND));
-    const ghostBonus = state.everAlerted ? 0 : SCORE_GHOST_BONUS;
-    state.score += SCORE_LEVEL_CLEAR + timeBonus + ghostBonus;
-    state.levelScore += SCORE_LEVEL_CLEAR + timeBonus + ghostBonus;
-    state.clearStats = { timeBonus, ghostBonus, time: state.time };
-    events |= EVENT_LEVEL_CLEAR;
-  }
-  return events;
-}
-
-// The run's rank, read off how loud it was.
-export function rankFor(state) {
-  if (!state.everAlerted) return 'GHOST';
-  if (state.timesSuspicious <= 2) return 'SHADOW';
+export function rankFor(maxDetection, alarms) {
+  if (maxDetection <= GHOST_MAX_DETECTION && alarms === 0) return 'GHOST';
+  if (maxDetection <= SHADOW_MAX_DETECTION) return 'SHADOW';
   return 'LOUD';
 }
 
-export { STEP };
+export function createWorld(levelIndex, seed, carry) {
+  const def = LEVELS[levelIndex];
+  const level = parseLevel(def);
+  const rng = makeRng((seed >>> 0) + levelIndex * 7919);
+  const guards = level.patrols.map((patrol) => {
+    const [sx, sy] = patrol[0];
+    const [nx, ny] = patrol[1];
+    return {
+      x: sx + 0.5,
+      y: sy + 0.5,
+      dir: Math.atan2(ny - sy, nx - sx),
+      state: 'patrol',
+      patrol,
+      wp: 1,
+      wpDir: 1,
+      wait: 0,
+      lastKnown: null,
+      searchT: 0,
+      stuckT: 0,
+      lx: sx + 0.5,
+      ly: sy + 0.5,
+    };
+  });
+  return {
+    levelIndex,
+    level,
+    cols: level.cols,
+    rows: level.rows,
+    grid: level.grid,
+    rng,
+    player: {
+      x: level.playerStart.x,
+      y: level.playerStart.y,
+      dir: 0,
+      moving: false,
+      running: false,
+    },
+    guards,
+    relics: level.relics,
+    exit: level.exit,
+    exitOpen: false,
+    coins: level.coins,
+    coinFx: [],
+    detection: 0,
+    maxDetection: carry ? carry.maxDetection : 0,
+    alarms: carry ? carry.alarms : 0,
+    score: carry ? carry.score : 0,
+    totalTime: carry ? carry.totalTime : 0,
+    levelTime: 0,
+    status: 'playing',
+    events: [],
+  };
+}
+
+function moveWithCollision(w, body, dx, dy, radius) {
+  // Axis-separated: try x, then y, so a body slides along walls.
+  const nx = body.x + dx;
+  if (!hitsWall(w, nx, body.y, radius)) body.x = nx;
+  const ny = body.y + dy;
+  if (!hitsWall(w, body.x, ny, radius)) body.y = ny;
+}
+
+function hitsWall(w, x, y, radius) {
+  for (const [ox, oy] of [[-radius, -radius], [radius, -radius], [-radius, radius], [radius, radius]]) {
+    if (isWall(w, x + ox, y + oy)) return true;
+  }
+  return false;
+}
+
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function guardTarget(guard) {
+  if (guard.state === 'patrol') {
+    const [tx, ty] = guard.patrol[guard.wp];
+    return { x: tx + 0.5, y: ty + 0.5 };
+  }
+  return guard.lastKnown;
+}
+
+function guardSpeed(guard) {
+  if (guard.state === 'alert') return GUARD_CHASE;
+  if (guard.state === 'suspicious' || guard.state === 'search') return GUARD_SUSPICIOUS;
+  return GUARD_PATROL;
+}
+
+// One fixed step. input: { mx, my, run, coin } where (mx,my) is a unit-ish
+// move direction and coin is {x,y} in tile coordinates, or null.
+export function stepWorld(w, input, dt) {
+  if (w.status !== 'playing') return;
+  const player = w.player;
+  w.levelTime += dt;
+  w.totalTime += dt;
+
+  // --- player movement ---
+  const mag = Math.hypot(input.mx || 0, input.my || 0);
+  player.moving = mag > 0.01;
+  player.running = !!input.run && player.moving;
+  if (player.moving) {
+    const speed = player.running ? PLAYER_RUN : PLAYER_SNEAK;
+    const nx = (input.mx / Math.max(1, mag)) * speed * dt;
+    const ny = (input.my / Math.max(1, mag)) * speed * dt;
+    player.dir = Math.atan2(input.my, input.mx);
+    moveWithCollision(w, player, nx, ny, 0.3);
+  }
+
+  // --- coin throw ---
+  if (input.coin && w.coins > 0) {
+    w.coins -= 1;
+    const land = throwCoinLanding(w, player, input.coin);
+    w.coinFx.push({ x: land.x, y: land.y, ttl: 1.2 });
+    w.events.push('coin');
+    for (const guard of w.guards) {
+      if (Math.hypot(guard.x - land.x, guard.y - land.y) <= NOISE_COIN_RADIUS) {
+        if (guard.state !== 'alert') guard.state = 'suspicious';
+        guard.lastKnown = { x: land.x, y: land.y };
+        guard.searchT = 0;
+      }
+    }
+  }
+  for (const fx of w.coinFx) fx.ttl -= dt;
+  w.coinFx = w.coinFx.filter((fx) => fx.ttl > 0);
+
+  // --- running noise ---
+  if (player.running) {
+    for (const guard of w.guards) {
+      if (Math.hypot(guard.x - player.x, guard.y - player.y) <= NOISE_RUN_RADIUS) {
+        if (guard.state === 'patrol') guard.state = 'suspicious';
+        if (guard.state === 'suspicious') guard.lastKnown = { x: player.x, y: player.y };
+      }
+    }
+  }
+
+  // --- relics + exit ---
+  for (const relic of w.relics) {
+    if (!relic.taken && Math.hypot(player.x - relic.x, player.y - relic.y) < 0.6) {
+      relic.taken = true;
+      w.score += RELIC_SCORE;
+      w.events.push('relic');
+      if (w.relics.every((r) => r.taken)) {
+        w.exitOpen = true;
+        w.events.push('exit-open');
+      }
+    }
+  }
+  if (w.exitOpen && Math.hypot(player.x - w.exit.x, player.y - w.exit.y) < 0.6) {
+    const timeBonus = Math.max(0, Math.round(w.level.par - w.levelTime));
+    w.score += LEVEL_CLEAR_SCORE + timeBonus;
+    w.events.push('clear');
+    if (w.levelIndex >= LEVELS.length - 1) {
+      w.status = 'won';
+      const rank = rankFor(w.maxDetection, w.alarms);
+      if (rank === 'GHOST') w.score += GHOST_BONUS;
+      else if (rank === 'SHADOW') w.score += SHADOW_BONUS;
+      w.rank = rank;
+    } else {
+      w.status = 'clear';
+    }
+    return;
+  }
+
+  // --- vision + detection ---
+  let anyoneSees = false;
+  for (const guard of w.guards) {
+    if (guardSees(w, guard, player.x, player.y)) {
+      anyoneSees = true;
+      const cover = coverAt(w, player.x, player.y);
+      w.detection += DETECT_RATE * cover * dt;
+      guard.lastKnown = { x: player.x, y: player.y };
+      if (w.detection >= ALERT_AT && guard.state !== 'alert') {
+        guard.state = 'alert';
+        guard.searchT = 0;
+      } else if (w.detection >= SUSPICIOUS_AT && guard.state === 'patrol') {
+        guard.state = 'suspicious';
+        guard.searchT = 0;
+      }
+    }
+  }
+  if (w.detection >= ALERT_AT && !w.alarmUp) {
+    w.alarmUp = true;
+    w.alarms += 1;
+    w.events.push('alarm');
+    for (const guard of w.guards) {
+      if (guard.state !== 'alert') {
+        guard.state = 'alert';
+        guard.lastKnown = { x: player.x, y: player.y };
+      }
+    }
+  }
+  if (!anyoneSees) {
+    w.detection = Math.max(0, w.detection - DETECT_DECAY * dt);
+    if (w.detection < SUSPICIOUS_AT) w.alarmUp = false;
+  }
+  w.detection = Math.min(100, w.detection);
+  if (w.detection > w.maxDetection) w.maxDetection = w.detection;
+
+  // --- guards ---
+  for (const guard of w.guards) {
+    updateGuard(w, guard, dt);
+  }
+
+  // --- caught? A guard that closes in on the player in the open ends it.
+  // Bushes hide the player even up close; breaking sight and hiding is
+  // always an escape, so an alarm is never a guaranteed catch.
+  const hidden = tileAt(w, player.x, player.y) === 'B';
+  if (!hidden) {
+    for (const guard of w.guards) {
+      if (guard.state !== 'patrol' && Math.hypot(guard.x - player.x, guard.y - player.y) < 0.55) {
+        w.status = 'caught';
+        w.events.push('caught');
+        return;
+      }
+    }
+  }
+}
+
+// A coin flies straight toward its target and stops at the first wall.
+function throwCoinLanding(w, player, target) {
+  const dx = target.x - player.x;
+  const dy = target.y - player.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len;
+  const uy = dy / len;
+  const maxDist = Math.min(6, len);
+  let t = 0.3;
+  while (t < maxDist) {
+    const x = player.x + ux * t;
+    const y = player.y + uy * t;
+    if (isWall(w, x, y)) break;
+    t += 0.15;
+  }
+  const land = Math.max(0.3, t - 0.15);
+  return { x: player.x + ux * land, y: player.y + uy * land };
+}
+
+function updateGuard(w, guard, dt) {
+  // Track whether the guard is actually making progress; a guard wedged
+  // against a wall while chasing gives up instead of camping it.
+  const moved = Math.hypot(guard.x - guard.lx, guard.y - guard.ly);
+  guard.lx = guard.x;
+  guard.ly = guard.y;
+  if (guard.state === 'alert' || guard.state === 'suspicious') {
+    if (moved < 0.02 * dt * 60 * 0.5) guard.stuckT += dt;
+    else guard.stuckT = 0;
+    if (guard.stuckT > STUCK_GIVE_UP) {
+      guard.stuckT = 0;
+      guard.state = 'search';
+      guard.searchT = SEARCH_TIME;
+    }
+  }
+
+  if (guard.state === 'patrol') {
+    if (guard.wait > 0) {
+      guard.wait -= dt;
+      if (guard.wait <= 0) {
+        guard.wp += guard.wpDir;
+        if (guard.wp >= guard.patrol.length) {
+          guard.wp = guard.patrol.length - 2;
+          guard.wpDir = -1;
+        } else if (guard.wp < 0) {
+          guard.wp = 1;
+          guard.wpDir = 1;
+        }
+      }
+      return;
+    }
+    const target = guardTarget(guard);
+    const arrived = stepToward(w, guard, target, GUARD_PATROL, dt);
+    if (arrived) {
+      guard.wait = 1.0;
+      const [nx, ny] = guard.patrol[(guard.wp + guard.wpDir + guard.patrol.length) % guard.patrol.length];
+      guard.dir = Math.atan2(ny + 0.5 - guard.y, nx + 0.5 - guard.x);
+    }
+    return;
+  }
+
+  if (guard.state === 'suspicious' || guard.state === 'alert') {
+    const target = guard.lastKnown;
+    if (!target) {
+      guard.state = 'search';
+      guard.searchT = SEARCH_TIME;
+      return;
+    }
+    const arrived = stepToward(w, guard, target, guardSpeed(guard), dt);
+    if (arrived) {
+      if (guard.state === 'alert') {
+        // Lost the player at the last known spot: search the area.
+        guard.state = 'search';
+        guard.searchT = SEARCH_TIME;
+      } else {
+        guard.state = 'search';
+        guard.searchT = SEARCH_TIME * 0.6;
+      }
+    }
+    return;
+  }
+
+  // search: stand and sweep the area, then walk back to the patrol.
+  if (guard.state === 'search') {
+    guard.searchT -= dt;
+    guard.dir += dt * 1.8;
+    if (guard.searchT <= 0) {
+      guard.state = 'patrol';
+      // Resume at the nearest waypoint.
+      let best = 0;
+      let bestD = Infinity;
+      guard.patrol.forEach(([px, py], i) => {
+        const d = Math.hypot(px + 0.5 - guard.x, py + 0.5 - guard.y);
+        if (d < bestD) {
+          bestD = d;
+          best = i;
+        }
+      });
+      guard.wp = best;
+      guard.wpDir = 1;
+      guard.wait = 0;
+    }
+  }
+}
+
+// Move a guard toward a point; returns true when it arrives (within 0.15).
+function stepToward(w, guard, target, speed, dt) {
+  const dx = target.x - guard.x;
+  const dy = target.y - guard.y;
+  const d = Math.hypot(dx, dy);
+  if (d < 0.15) return true;
+  const step = Math.min(d, speed * dt);
+  const ox = guard.x;
+  const oy = guard.y;
+  moveWithCollision(w, guard, (dx / d) * step, (dy / d) * step, 0.3);
+  const moved = Math.hypot(guard.x - ox, guard.y - oy);
+  if (moved > 0.001) guard.dir = Math.atan2(guard.y - oy, guard.x - ox);
+  return d - moved < 0.15;
+}

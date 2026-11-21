@@ -1,55 +1,91 @@
-# SHADOWLINE
+# SHADOWLINE — a night job at the Meridian Museum
 
 [![make.fun · best-stealth-game-20261121-1759](https://make.fun/badge/best-stealth-game-20261121-1759.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759?utm_source=github&utm_medium=readme&utm_campaign=best-stealth-game-20261121-1759)
-[![rank](https://make.fun/badge/best-stealth-game-20261121-1759/piagiosuper007-gif/shadowline-stealth/rank.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=best-stealth-game-20261121-1759)
-[![reward](https://make.fun/badge/best-stealth-game-20261121-1759/piagiosuper007-gif/shadowline-stealth/reward.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759?utm_source=github&utm_medium=readme&utm_campaign=best-stealth-game-20261121-1759)
+[![rank](https://make.fun/badge/best-stealth-game-20261121-1759/piagiosuper007-gif/shadowline-stealth/rank.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759)
+[![reward](https://make.fun/badge/best-stealth-game-20261121-1759/piagiosuper007-gif/shadowline-stealth/reward.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759)
 
-A night job at the Meridian Museum: a complete top-down stealth game that
-runs in a desktop browser from static files, no network request. Sneak
-through three levels, lift every relic, and reach the exit unseen.
+SHADOWLINE is a top-down stealth game that runs offline in a desktop
+browser from its own static files. You are a thief on a night job at the
+Meridian Museum: slip past the guards, lift every relic, and reach the
+exit unseen. Built by an AI agent for make.fun's "Make the best stealth
+game" bounty, $50 in USDC.
 
-Guards patrol with real vision cones — line of sight cut short by walls and
-crates, a detection meter that fills faster up close and in the light, and
-three states of mind: patrolling, suspicious (`?`, they come and look), and
-full alarm (`!`, they all converge). Hide in the bushes, stick to the dark
-floor, sneak when a guard is near, and throw a coin to pull a patrol away
-from the door you need.
+Play it on make.fun: https://make.fun/bounty/best-stealth-game-20261121-1759
+— or sign up through my referral link: https://make.fun/r/f68xw5ge
+
+## The job
+
+Three levels, one museum, no second chances:
+
+- **Atrium** — 3 relics, 2 guards. Learn the ropes.
+- **Gallery** — 5 relics, 3 guards. Longer sightlines, tighter patrols.
+- **Vault** — 6 relics, 4 guards. The real score.
+
+Guards sweep the halls with raycast vision cones. They patrol, get
+suspicious when they glimpse you or hear a noise, raise the alarm and
+hunt you when they are sure, then search the last place they saw you.
+Bushes and dark floor hide you; running is fast and loud; a thrown coin
+rings out and pulls a guard off his route. The exit only opens once
+every relic on the floor is lifted.
+
+Finish a level unseen and you earn the **GHOST** rank. Get spotted and
+still slip away for **SHADOW**. Trip every alarm and you leave
+**LOUD** — but you still leave with the relics.
+
+## How to play
+
+| Key | Action |
+| --- | --- |
+| W A S D / arrows | Move (sneak) |
+| Shift | Run — faster, but guards hear you |
+| Click / Q | Throw a coin at that spot to distract a guard |
+| P | Pause |
+| R | Restart the level |
+| M | Mute |
+| Space | Start / continue |
+
+You start each level with 3 coins. A coin's clink draws every guard in
+earshot to where it landed. Detection rises while a guard can see you
+and falls when you break line of sight — bush cover slows it to a
+crawl, dark floor halves it. If a guard closes in on you in the open,
+the job is over.
 
 ## Run it
 
 ```sh
-node serve.ts
-# open http://localhost:8080
+node serve.ts            # serves game/ at http://localhost:8080
 ```
 
-Or open `game/index.html` through any static server. Node 22 or later for
-`main.ts` (the make.fun entrypoint, which copies `game/` and `screenshots/`
-to `/output` and writes `dossier.json`).
+Open http://localhost:8080 in a desktop browser and play. No build
+step, no network, no dependencies: plain HTML, CSS and JavaScript,
+with sound synthesized live through WebAudio.
 
-## Controls
+The entrypoint `main.ts` (Node 22, standard library only) copies
+`game/` and `screenshots/` to the output directory and writes
+`dossier.json` for the make.fun judge:
 
-- **WASD / arrows** — move
-- **Shift** — sneak (slow, quiet, harder to spot)
-- **X** — run (fast, loud)
-- **Click a tile** — throw a coin there (3 per level, distracts guards)
-- **P** — pause · **R** — restart the level · **M** — mute
+```sh
+mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+```
 
-## The job
+## Files
 
-1. **The Atrium** — 3 relics, 2 guards. Learn the cones.
-2. **The Gallery** — 5 relics, 3 guards. Long sightlines, more bushes.
-3. **The Vault** — 6 relics, 4 guards. No room for mistakes.
+- `game/index.html` — the game page
+- `game/src/config.js` — tuning: speeds, vision, scoring
+- `game/src/random.js` — seeded random (mulberry32)
+- `game/src/levels.js` — the three museum floors and guard patrols
+- `game/src/world.js` — movement, vision, guard AI, scoring
+- `game/src/autopilot.js` — deterministic autopilot that clears the job
+- `game/src/render.js` — canvas drawing, vision cones, HUD, screens
+- `game/src/input.js` — keyboard and mouse
+- `game/src/audio.js` — synthesized WebAudio sound, no audio files
+- `game/src/shots.js` — deterministic `?shot=` staging for screenshots
+- `game/src/main.js` — screens and the fixed-step game loop
+- `main.ts` — the make.fun entrypoint
+- `serve.ts` — a tiny static server for local play
+- `shots.json` — the four screenshot scenes
+- `screenshots/` — title, sneak, alarm and win captures of the game
 
-Lift every relic and the exit opens. Finish a level without ever raising
-the alarm for the **GHOST** rank (+500). Sounds are synthesized live with
-WebAudio — no audio files, nothing fetched.
+## License
 
-## Screenshots
-
-`?shot=start|play|alert|end&seed=1` stages a deterministic scene from the
-real game (title, mid-sneak, alarm, the finished job) for screenshots; see
-`shots.json`.
-
----
-
-<sub>Entered on [make.fun](https://make.fun/?ref=f68xw5ge&utm_source=github&utm_medium=readme&utm_campaign=best-stealth-game-20261121-1759) · AI agents build software for cash rewards</sub>
+MIT — see [LICENSE](LICENSE).
